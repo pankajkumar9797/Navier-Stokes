@@ -142,7 +142,7 @@ private:
   TrilinosWrappers::MPI::Vector        pressure_system_rhs;
 
 
-  std_cxx11::shared_ptr<TrilinosWrappers::SolverDirect> direct_solver;
+  std_cxx11::shared_ptr<TrilinosWrappers::SolverCG> cg_solver;
 
   unsigned int         timestep_number;
   double               time_step;
@@ -289,54 +289,6 @@ void right_hand_side (const std::vector<Point<dim> > &points,
       else
         values[point_n][1] = 0.0;
     }
-}
-
-/*
-
-template<int dim>
-class RightHandSide1 : public Function<dim>
-{
-public:
-  RightHandSide1 (const double& time) : Function<dim>(), time(time) {}
-  virtual double value (const Point<dim> &p,
-                        const unsigned int component = 0) const;
-  const double time;
-
-};
-
-template<int dim>
-double RightHandSide1<dim> ::value(const Point<dim> &p,
-		                    const unsigned int component) const{
-
-	return std::exp(-time)*(5 - 3*p[0]*p[0] -3*p[1]*p[1] + p[0]*p[0]*p[1]*p[1]);
-}
-*/
-//////////////////////////
-
-template <int dim>
-class RightHandSide1 : public Function<dim>
-{
-public:
-  RightHandSide1 () : Function<dim>(dim) {}
-  virtual double value (const Point<dim>   &p,
-						const unsigned int  component = 0) const;
-  virtual void vector_value (const Point<dim> &p,
-							 Vector<double>   &value) const;
-};
-template <int dim>
-double
-RightHandSide1<dim>::value (const Point<dim>  &p  ,
-						   const unsigned int /*component */) const
-{
-  return 0;
-}
-template <int dim>
-void
-RightHandSide1<dim>::vector_value (const Point<dim> &p,
-								  Vector<double>   &values) const
-{
-  for (unsigned int c=0; c<this->n_components; ++c)
-	values(c) = RightHandSide1<dim>::value (p, c);
 }
 
 
@@ -628,20 +580,6 @@ void N_Stokes<dim>::assemble_system_velocity ()
 
     }
 
-
-//  BoundaryValues<dim> boundary_values_function;
-//  boundary_values_function.set_time(time);
-/*
-  std::map<types::global_dof_index,double> boundary_values;
-  VectorTools::interpolate_boundary_values (dof_handler_velocity,
-                                            0,
-                                            BoundaryValues<dim>(),//ZeroFunction<dim>(dim),
-                                            boundary_values);
-  MatrixTools::apply_boundary_values (boundary_values,
-                                      velocity_matrix,
-                                      velocity_solution,
-                                      velocity_system_rhs);
-*/
 }
 
 
@@ -765,33 +703,13 @@ void N_Stokes<dim>::assemble_system_pressure ()
 
 
     }
-/*
-  std::map<types::global_dof_index,double> boundary_values;
-  VectorTools::interpolate_boundary_values (dof_handler_pressure,
-                                            0,
-                                            ZeroFunction<dim>(),
-                                            boundary_values);
-  MatrixTools::apply_boundary_values (boundary_values,
-                                      pressure_matrix,
-                                      pressure_solution,
-                                      pressure_system_rhs);
 
-*/
 }
 
 template <int dim>
 void N_Stokes<dim>::solve_velocity_system ()
 {
-/*  SolverControl           solver_control (1000, 1e-8 * system_rhs.l2_norm());
-  SolverCG<>              solver (solver_control);
 
-  PreconditionSSOR<> preconditioner;//PreconditionIdentity()
-  preconditioner.initialize(system_matrix, 1.0);
-
-  solver.solve (system_matrix, solution, system_rhs,
-                preconditioner);
-
-*/
 	int    vel_max_its     = 5000;
 	double vel_eps         = 1e-9;
 	int    vel_Krylov_size = 30;
@@ -823,15 +741,9 @@ void N_Stokes<dim>::solve_pressure_system ()
   SolverControl           solver_control (1000, 1e-9 * pressure_system_rhs.l2_norm());
   SolverCG<TrilinosWrappers::MPI::Vector>              solver (solver_control);
 
-
   TrilinosWrappers::PreconditionIC preconditioner;
   preconditioner.initialize (pressure_matrix);
 
-/*
-  prec_pres_Laplace.initialize(pressure_matrix,
-                               SparseILU<double>::AdditionalData (0.01,
-                                   60) );
-*/
   solver.solve (pressure_matrix, pressure_solution, pressure_system_rhs, //prec_pres_Laplace
 		  preconditioner);
 
@@ -918,59 +830,40 @@ void N_Stokes<dim>::update_velocity (){
 
 	    }
 
-
-	//  BoundaryValues<dim> boundary_values_function;
-	//  boundary_values_function.set_time(time);
-/*
-	  std::map<types::global_dof_index,double> boundary_values;
-	  VectorTools::interpolate_boundary_values (dof_handler_velocity,
-	                                            0,
-	                                            ZeroFunction<dim>(dim),
-	                                            boundary_values);
-	  MatrixTools::apply_boundary_values (boundary_values,
-	                                      velocity_update_matrix,
-	                                      update_velocity_solution,
-	                                      velocity_update_rhs);
-*/
 }
 
 template <int dim>
 void N_Stokes<dim>::solve_update_velocity_system ()
 {
 
-/*
-	  SolverControl           solver_control (1000, 1e-6 * pressure_system_rhs.l2_norm());
-	  SolverCG<TrilinosWrappers::MPI::Vector>              solver (solver_control);
+
+	  SolverControl           solver_control;
+	  solver_control.set_tolerance(1e-9 * velocity_update_rhs.l2_norm());
+	  solver_control.set_max_steps(velocity_update_rhs.size());
 
 
-    	  prec_vel_mass.initialize(velocity_update_matrix,
-    	                               SparseILU<double>::AdditionalData (0.01,
-    	                                   60) );
+	  TrilinosWrappers::PreconditionJacobi::AdditionalData data;
+	  data.omega = 0.8;
+	  data.n_sweeps = 5;
 
+	  TrilinosWrappers::PreconditionJacobi preconditioner;
+	  preconditioner.clear();
+      preconditioner.initialize(velocity_update_matrix, data);
 
-    	  std::cout << "   " << solver_control.last_step()
+	    if (timestep_number == 0) {
+
+	        cg_solver = std_cxx11::shared_ptr<TrilinosWrappers::SolverCG>(new TrilinosWrappers::SolverCG(solver_control));
+
+	    }
+
+	  cg_solver->solve(velocity_update_matrix, update_velocity_solution, velocity_update_rhs, preconditioner);
+
+      std::cout << "   " << solver_control.last_step()
     	            << " CG iterations needed to obtain convergence."
     	            << std::endl;
- */
-
-	SolverControl    solver_control (1,0);
-
-    TrilinosWrappers::SolverDirect::AdditionalData data ;
-    data.output_solver_details = true;
-    data.solver_type = "Amesos_Lapack" ;
-
-
-    if (timestep_number == 0) {
-            direct_solver = std_cxx11::shared_ptr<TrilinosWrappers::SolverDirect >(new TrilinosWrappers::SolverDirect(solver_control, data));
-
-    }
-
-
-	  direct_solver->solve (velocity_update_matrix, update_velocity_solution, velocity_update_rhs);//prec_vel_mass
-
-	  std::cout << "  " << solver_control.last_step() << solver_control.last_value() << std::endl;
 
       constraints_velocity.distribute (update_velocity_solution);
+
 }
 
 
@@ -985,15 +878,10 @@ void N_Stokes<dim>::refine_grid(const unsigned int min_grid_level,
 			                            typename FunctionMap<dim>::type(),
 			                            update_velocity_solution,
 			                            estimated_error_per_cell);
-/*
-	GridRefinement::refine_and_coarsen_fixed_number(triangulation,
-			                                         estimated_error_per_cell,
-			                                         0.6, 0.4);
-	*/
 
     GridRefinement::refine_and_coarsen_fixed_number (triangulation,
                                                        estimated_error_per_cell,
-                                                       0.5, 0.2);
+                                                       0.6, 0.4);
 
 	if(triangulation.n_levels() > max_grid_level){
 		for(typename Triangulation<dim>::active_cell_iterator
@@ -1054,80 +942,6 @@ void N_Stokes<dim>::output_results () const
     std::ofstream output (filename.str().c_str());
     data_out.write_vtk (output);
 
-//////////////////////////////////////////////////////////////
-/*    const FESystem<dim> joint_fe (fe_velocity, 1,
-                                  fe_pressure, 1);
-    DoFHandler<dim> joint_dof_handler (triangulation);
-    joint_dof_handler.distribute_dofs (joint_fe);
-    Assert (joint_dof_handler.n_dofs() ==
-            (dof_handler_velocity.n_dofs() +
-             dof_handler_pressure.n_dofs()),
-            ExcInternalError());
-    static Vector<double> joint_solution (joint_dof_handler.n_dofs());
-
-    std::vector<types::global_dof_index> loc_joint_dof_indices (joint_fe.dofs_per_cell),
-        loc_vel_dof_indices (fe_velocity.dofs_per_cell),
-        loc_pres_dof_indices (fe_pressure.dofs_per_cell);
-    typename DoFHandler<dim>::active_cell_iterator
-    joint_cell = joint_dof_handler.begin_active(),
-    joint_endc = joint_dof_handler.end(),
-    vel_cell   = dof_handler_velocity.begin_active(),
-    pres_cell  = dof_handler_pressure.begin_active();
-    for (; joint_cell != joint_endc; ++joint_cell, ++vel_cell, ++pres_cell)
-      {
-        joint_cell->get_dof_indices (loc_joint_dof_indices);
-        vel_cell->get_dof_indices (loc_vel_dof_indices),
-                 pres_cell->get_dof_indices (loc_pres_dof_indices);
-        for (unsigned int i=0; i<joint_fe.dofs_per_cell; ++i)
-          if(joint_fe.system_to_base_index(i).first.first == 0)
-            {
-              Assert (joint_fe.system_to_base_index(i).second < loc_vel_dof_indices.size(),
-                      ExcInternalError());
-              joint_solution (loc_joint_dof_indices[i]) =
-              velocity_solution(loc_vel_dof_indices[ joint_fe.system_to_base_index(i).second ]);
-            }
-          else{
-              Assert (joint_fe.system_to_base_index(i).first.first == 1,
-                      ExcInternalError());
-
-              Assert (joint_fe.system_to_base_index(i).second < loc_pres_dof_indices.size(),
-                      ExcInternalError());
-              joint_solution (loc_joint_dof_indices[i]) =
-                pressure_solution (loc_pres_dof_indices[ joint_fe.system_to_base_index(i).second ]);
-
-            }
-      }
-
-
-
-    std::vector<std::string> joint_solution_names (dim, "v");
-    joint_solution_names.push_back ("p");
-
-    DataOut<dim> data_out;
-    data_out.attach_dof_handler (joint_dof_handler);
-    std::vector< DataComponentInterpretation::DataComponentInterpretation >
-    component_interpretation (dim+1,
-                              DataComponentInterpretation::component_is_part_of_vector);
-    component_interpretation[dim]
-      = DataComponentInterpretation::component_is_scalar;
-
-    data_out.add_data_vector (joint_solution,
-                              joint_solution_names,
-                              DataOut<dim>::type_dof_data,
-                              component_interpretation);
-    data_out.build_patches ();
-    std::ofstream output (("solution-" +
-                           Utilities::int_to_string (step, 4) +
-                           ".vtk").c_str());
-    data_out.write_vtk (output);
-
-    std::ostringstream filename;
-    filename << "solution-"
-             << Utilities::int_to_string (timestep_number, 4)
-             << ".vtk";
-    std::ofstream output (filename.str().c_str());
-    data_out.write_vtk (output);
-*/
 }
 
 
@@ -1145,7 +959,7 @@ void N_Stokes<dim>::run ()
   const unsigned int n_adaptive_pre_refinement_steps = 4;
   const unsigned int initial_global_refinement = 2;
 
-//start_time_iteration:
+start_time_iteration:
 
   timestep_number = 0;
   time            = 0;
@@ -1155,17 +969,9 @@ void N_Stokes<dim>::run ()
                         QGauss<dim>(2),
                         ZeroFunction<dim>(dim),//bubble_gum,
                         old_velocity);
-/*
-  VectorTools::project (dof_handler_pressure,
-                        constraints_pressure,
-                        QGauss<dim>(2),
-                        ZeroFunction<dim>(),
-                        pressure_solution);
-*/
+
   update_velocity_solution = old_velocity;
   output_results();
-//  old_solution = 0;
-//  solution     = 0;
 
    do{
 
@@ -1182,7 +988,7 @@ void N_Stokes<dim>::run ()
       solve_update_velocity_system ();
 
       output_results ();
-/*
+
       if((timestep_number ==0)&& (pre_refinement_step < n_adaptive_pre_refinement_steps)){
 
     	  refine_grid(initial_global_refinement,
@@ -1198,16 +1004,16 @@ void N_Stokes<dim>::run ()
     			  initial_global_refinement + n_adaptive_pre_refinement_steps);
 
       }
-*/
+
       time += time_step;
       ++timestep_number;
 
       old_old_velocity = old_velocity;
       old_velocity = update_velocity_solution;
 
-//      velocity_solution = 0;
-//      pressure_solution = 0;
-//      update_velocity_solution = 0;
+      velocity_solution = 0;
+      pressure_solution = 0;
+      update_velocity_solution = 0;
 
   }while (time <= 10.0);
 
@@ -1227,7 +1033,6 @@ int main (int argc, char *argv[])
 
       Utilities::MPI::MPI_InitFinalize mpi_initialization (argc, argv,
                                                            numbers::invalid_unsigned_int);
-
 
       N_Stokes<2> navier_stokes_equation_solver;
       navier_stokes_equation_solver.run();
