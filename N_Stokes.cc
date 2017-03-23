@@ -17,11 +17,16 @@
  * Author: Pankaj Kumar, MSc 2017.
  */
 
+#include <deal.II/base/timer.h>
+#include <deal.II/lac/generic_linear_algebra.h>
+
 #include <deal.II/base/utilities.h>
 #include <deal.II/base/quadrature_lib.h>
 #include <deal.II/base/function.h>
 #include <deal.II/base/tensor_function.h>
 #include <deal.II/base/logstream.h>
+#include <deal.II/base/conditional_ostream.h>
+#include <deal.II/base/index_set.h>
 #include <deal.II/lac/vector.h>
 #include <deal.II/lac/full_matrix.h>
 #include <deal.II/lac/compressed_sparsity_pattern.h>
@@ -31,6 +36,7 @@
 #include <deal.II/lac/precondition.h>
 #include <deal.II/lac/sparse_ilu.h>
 #include <deal.II/lac/constraint_matrix.h>
+#include <deal.II/lac/sparsity_tools.h>
 #include <deal.II/grid/tria.h>
 #include <deal.II/grid/grid_generator.h>
 #include <deal.II/grid/grid_refinement.h>
@@ -65,6 +71,11 @@
 #include <cmath>
 #include <sstream>
 #include <deal.II/base/logstream.h>
+
+#include <deal.II/distributed/solution_transfer.h>
+#include <deal.II/base/index_set.h>
+#include <deal.II/distributed/tria.h>
+#include <deal.II/distributed/grid_refinement.h>
 
 
 using namespace dealii;
@@ -108,7 +119,8 @@ private:
   void refine_grid (const unsigned int min_grid_level, const unsigned int max_grid_level);
   void output_results () const;
 
-  Triangulation<dim>   triangulation;
+  parallel::distributed::Triangulation<dim>    triangulation;
+  ConditionalOStream   pcout;
 
   FESystem<dim>        fe_velocity;
   FE_Q<dim>            fe_pressure;
@@ -118,9 +130,6 @@ private:
 
   ConstraintMatrix     constraints_velocity;
   ConstraintMatrix     constraints_pressure;
-
-  SparsityPattern      sparsity_pattern_velocity;
-  SparsityPattern      sparsity_pattern_pressure;
 
   SparseILU<double>    prec_pres_Laplace;
   SparseILU<double>    prec_vel_mass;
@@ -136,13 +145,21 @@ private:
   TrilinosWrappers::MPI::Vector        update_velocity_solution;
   TrilinosWrappers::MPI::Vector        velocity_system_rhs;
   TrilinosWrappers::MPI::Vector        velocity_update_rhs;
+  TrilinosWrappers::MPI::Vector        non_ghost_velocity;
 
   TrilinosWrappers::MPI::Vector        old_pressure;
   TrilinosWrappers::MPI::Vector        pressure_solution;
   TrilinosWrappers::MPI::Vector        pressure_system_rhs;
 
+  IndexSet                             locally_owned_velocity_dofs;
+  IndexSet                             locally_relevant_velocity_dofs;
+
+  IndexSet                             locally_owned_pressure_dofs;
+  IndexSet                             locally_relevant_pressure_dofs;
 
   std_cxx11::shared_ptr<TrilinosWrappers::SolverCG> cg_solver;
+
+  TimerOutput computing_timer;
 
   unsigned int         timestep_number;
   double               time_step;
@@ -151,7 +168,7 @@ private:
   double               theta_imex;
   double               theta_skew;
 
-  const double         nu = 0.01;
+  const double         nu = 1./400;
 };
 
 
@@ -369,13 +386,24 @@ N_Stokes<dim>::N_Stokes ()
   :
   fe_velocity (FE_Q<dim>(2), dim),
   fe_pressure(1),
+  triangulation (MPI_COMM_WORLD,
+				 typename Triangulation<dim>::MeshSmoothing
+				 (Triangulation<dim>::smoothing_on_refinement |
+				  Triangulation<dim>::smoothing_on_coarsening)),
   dof_handler_velocity (triangulation),
   dof_handler_pressure (triangulation),
   timestep_number(0),
   time_step(1. / 500),
   time(0),
   theta_imex(0.5),
-  theta_skew(0.5)
+  theta_skew(0.5),
+  pcout (std::cout,
+         (Utilities::MPI::this_mpi_process(MPI_COMM_WORLD)
+          == 0)),
+  computing_timer (MPI_COMM_WORLD,
+				   pcout,
+				   TimerOutput::summary,
+				   TimerOutput::wall_times)
 {}
 
 template <int dim>
@@ -391,7 +419,7 @@ void N_Stokes<dim>::make_grid ()
 //  GridGenerator::hyper_cube (triangulation, -1, 1);
   triangulation.refine_global (4);
 
-  std::cout << "   Number of active cells: "
+  pcout << "   Number of active cells: "
             << triangulation.n_active_cells()
             << std::endl
             << "   Total number of cells: "
@@ -403,10 +431,18 @@ void N_Stokes<dim>::make_grid ()
 template <int dim>
 void N_Stokes<dim>::setup_system ()
 {
+  TimerOutput::Scope t(computing_timer, "setup");
+
   dof_handler_velocity.distribute_dofs (fe_velocity);
   dof_handler_pressure.distribute_dofs (fe_pressure);
 
-  std::cout << "   Number of degrees of freedom(velocity + pressure): "
+  locally_owned_velocity_dofs = dof_handler_velocity.locally_owned_dofs();
+  DoFTools::extract_locally_relevant_dofs(dof_handler_velocity, locally_relevant_velocity_dofs);
+
+  locally_owned_pressure_dofs = dof_handler_pressure.locally_owned_dofs();
+  DoFTools::extract_locally_relevant_dofs(dof_handler_pressure, locally_relevant_pressure_dofs);
+
+  pcout << "   Number of degrees of freedom(velocity + pressure): "
             << dof_handler_velocity.n_dofs() + dof_handler_pressure.n_dofs()
             << std::endl;
 
@@ -414,6 +450,7 @@ void N_Stokes<dim>::setup_system ()
 
   {
   constraints_velocity.clear ();
+  constraints_velocity.reinit(locally_relevant_velocity_dofs);
 
   DoFTools::make_hanging_node_constraints(dof_handler_velocity, constraints_velocity);
 
@@ -429,11 +466,14 @@ void N_Stokes<dim>::setup_system ()
                                                    constraints_velocity);
 */
   }
+
+  {
   constraints_velocity.close();
 
 
   constraints_pressure.clear ();
-/*
+  constraints_pressure.reinit(locally_relevant_pressure_dofs);
+
   DoFTools::make_hanging_node_constraints(dof_handler_pressure, constraints_pressure);
 
   VectorTools::interpolate_boundary_values (dof_handler_pressure,
@@ -441,40 +481,49 @@ void N_Stokes<dim>::setup_system ()
                                             ZeroFunction<dim>(),
                                             constraints_pressure);
 
-*/
+  }
   constraints_pressure.close();
 
-  DynamicSparsityPattern  velocity_sparsity(dof_handler_velocity.n_dofs());
+  DynamicSparsityPattern  velocity_sparsity(locally_relevant_velocity_dofs);
   DoFTools::make_sparsity_pattern(dof_handler_velocity, velocity_sparsity, constraints_velocity, /*keep_constrained_dofs = */ false);
 
-  sparsity_pattern_velocity.copy_from(velocity_sparsity);
+  SparsityTools::distribute_sparsity_pattern (velocity_sparsity,
+                                              dof_handler_velocity.n_locally_owned_dofs_per_processor(),
+                                              MPI_COMM_WORLD,
+                                              locally_relevant_velocity_dofs);
 
-  DynamicSparsityPattern  pressure_sparsity(dof_handler_pressure.n_dofs());
+
+  DynamicSparsityPattern  pressure_sparsity(locally_relevant_pressure_dofs);
   DoFTools::make_sparsity_pattern(dof_handler_pressure, pressure_sparsity, constraints_pressure, /*keep_constrained_dofs = */ false);
 
-  sparsity_pattern_pressure.copy_from(pressure_sparsity);
+  SparsityTools::distribute_sparsity_pattern (pressure_sparsity,
+                                               dof_handler_pressure.n_locally_owned_dofs_per_processor(),
+                                               MPI_COMM_WORLD,
+                                               locally_relevant_pressure_dofs);
 
-  velocity_matrix.reinit (sparsity_pattern_velocity);
-  pressure_matrix.reinit (sparsity_pattern_pressure);
-  velocity_update_matrix.reinit (sparsity_pattern_velocity);
 
-  const unsigned int n_u = dof_handler_velocity.n_dofs();
-  const unsigned int n_p = dof_handler_pressure.n_dofs();
 
-  IndexSet velocity_partitioning = complete_index_set (n_u);
-  IndexSet pressure_partitioning = complete_index_set (n_p);
+  velocity_matrix.reinit (locally_owned_velocity_dofs, locally_owned_velocity_dofs,
+		                  velocity_sparsity, MPI_COMM_WORLD);
+  pressure_matrix.reinit (locally_owned_pressure_dofs, locally_owned_pressure_dofs,
+          	  	  	  	  pressure_sparsity, MPI_COMM_WORLD);
+  velocity_update_matrix.reinit (locally_owned_velocity_dofs, locally_owned_velocity_dofs,
+          	  	  	  	  	  	 velocity_sparsity, MPI_COMM_WORLD);
 
-  old_velocity.reinit(velocity_partitioning, MPI_COMM_WORLD);
-  old_old_velocity.reinit(velocity_partitioning, MPI_COMM_WORLD);
-  velocity_solution.reinit (velocity_partitioning, MPI_COMM_WORLD);
-  update_velocity_solution.reinit (velocity_partitioning, MPI_COMM_WORLD);
 
-  velocity_system_rhs.reinit (velocity_partitioning, MPI_COMM_WORLD);
-  velocity_update_rhs.reinit (velocity_partitioning, MPI_COMM_WORLD);
+  old_velocity.reinit(locally_owned_velocity_dofs, locally_relevant_velocity_dofs, MPI_COMM_WORLD);
+  old_old_velocity.reinit(locally_owned_velocity_dofs, locally_relevant_velocity_dofs, MPI_COMM_WORLD);
+  velocity_solution.reinit (locally_owned_velocity_dofs, locally_relevant_velocity_dofs, MPI_COMM_WORLD);
+  update_velocity_solution.reinit (locally_owned_velocity_dofs, locally_relevant_velocity_dofs, MPI_COMM_WORLD);
+  non_ghost_velocity.reinit(locally_owned_velocity_dofs, MPI_COMM_WORLD);
 
-  old_pressure.reinit(pressure_partitioning, MPI_COMM_WORLD);
-  pressure_solution.reinit (pressure_partitioning, MPI_COMM_WORLD);
-  pressure_system_rhs.reinit (pressure_partitioning, MPI_COMM_WORLD);
+  velocity_system_rhs.reinit (locally_owned_velocity_dofs, MPI_COMM_WORLD);
+  velocity_update_rhs.reinit (locally_owned_velocity_dofs, MPI_COMM_WORLD);
+
+  old_pressure.reinit(locally_owned_pressure_dofs, locally_relevant_pressure_dofs, MPI_COMM_WORLD);
+  pressure_solution.reinit (locally_owned_pressure_dofs, locally_relevant_pressure_dofs, MPI_COMM_WORLD);
+
+  pressure_system_rhs.reinit (locally_owned_pressure_dofs, MPI_COMM_WORLD);
 
 }
 
@@ -511,12 +560,15 @@ void N_Stokes<dim>::assemble_system_velocity ()
 
   std::vector<Vector<double> >      rhs_values (n_q_points, Vector<double>(dim));
 
+
+
   typename DoFHandler<dim>::active_cell_iterator
   cell = dof_handler_velocity.begin_active(),
   endc = dof_handler_velocity.end();
 
   for (; cell!=endc; ++cell)
-    {
+	  if (cell->is_locally_owned()){
+
       fe_values.reinit (cell);
 
       const FEValuesViews::Vector<dim>& fe_vector_values = fe_values[FEValuesExtractors::Vector(0)];
@@ -580,6 +632,9 @@ void N_Stokes<dim>::assemble_system_velocity ()
 
     }
 
+  velocity_matrix.compress (VectorOperation::add);
+  velocity_system_rhs.compress (VectorOperation::add);
+
 }
 
 
@@ -627,7 +682,6 @@ void N_Stokes<dim>::assemble_system_pressure ()
 
   const double dt_1 = 1.0/time_step;
 
-
   typename DoFHandler<dim>::active_cell_iterator
   cell = dof_handler_pressure.begin_active(),
   endc = dof_handler_pressure.end();
@@ -635,6 +689,9 @@ void N_Stokes<dim>::assemble_system_pressure ()
   cell_v = dof_handler_velocity.begin_active();
   for (; cell!=endc; ++cell, ++cell_v)
     {
+	  if (cell->is_locally_owned() == false)
+	    continue;
+
       fe_values.reinit (cell);
       fe_values_velocity.reinit(cell_v);
 
@@ -688,7 +745,6 @@ void N_Stokes<dim>::assemble_system_pressure ()
 
       cell->get_dof_indices (local_dof_indices);
 
-
 	int idx = neum_cond::find_index_of_0(local_dof_indices);
 	if (idx != -1) {
 		neum_cond::clear_rowcol_but_dia(cell_matrix, idx);
@@ -701,8 +757,10 @@ void N_Stokes<dim>::assemble_system_pressure ()
                                           pressure_matrix,
                                           pressure_system_rhs);
 
-
     }
+
+  pressure_matrix.compress (VectorOperation::add);
+  pressure_system_rhs.compress (VectorOperation::add);
 
 }
 
@@ -714,6 +772,7 @@ void N_Stokes<dim>::solve_velocity_system ()
 	double vel_eps         = 1e-9;
 	int    vel_Krylov_size = 30;
 
+  TrilinosWrappers::MPI::Vector        completely_distributed_solution(locally_owned_velocity_dofs, MPI_COMM_WORLD);
 
   TrilinosWrappers::PreconditionSSOR preconditioner;
   preconditioner.initialize(velocity_matrix);
@@ -722,16 +781,18 @@ void N_Stokes<dim>::solve_velocity_system ()
 	{
 		SolverGMRES<TrilinosWrappers::MPI::Vector> gmres1 (solver_control,
 						   SolverGMRES<TrilinosWrappers::MPI::Vector>::AdditionalData (vel_Krylov_size));
-		gmres1.solve (velocity_matrix, velocity_solution, velocity_system_rhs, preconditioner);
+		gmres1.solve (velocity_matrix, completely_distributed_solution, velocity_system_rhs, preconditioner);
 	}
 
 
 
-  std::cout << "   " << solver_control.last_step()
+	pcout << "   " << solver_control.last_step()
             << " GMRES iterations needed to obtain convergence."
             << std::endl;
 
-  constraints_velocity.distribute (velocity_solution);
+  constraints_velocity.distribute (completely_distributed_solution);
+
+  velocity_solution = completely_distributed_solution;
 }
 
 
@@ -741,19 +802,23 @@ void N_Stokes<dim>::solve_pressure_system ()
   SolverControl           solver_control (1000, 1e-9 * pressure_system_rhs.l2_norm());
   SolverCG<TrilinosWrappers::MPI::Vector>              solver (solver_control);
 
+  TrilinosWrappers::MPI::Vector        completely_distributed_solution(locally_owned_pressure_dofs, MPI_COMM_WORLD);
+
   TrilinosWrappers::PreconditionIC preconditioner;
   preconditioner.initialize (pressure_matrix);
 
-  solver.solve (pressure_matrix, pressure_solution, pressure_system_rhs, //prec_pres_Laplace
+  solver.solve (pressure_matrix, completely_distributed_solution, pressure_system_rhs, //prec_pres_Laplace
 		  preconditioner);
 
 
 
-  std::cout << "   " << solver_control.last_step()
+  pcout << "   " << solver_control.last_step()
             << " CG iterations needed to obtain convergence."
             << std::endl;
 
-  constraints_pressure.distribute (pressure_solution);
+  constraints_pressure.distribute (completely_distributed_solution);
+
+  pressure_solution = completely_distributed_solution;
 }
 
 template <int dim>
@@ -792,6 +857,9 @@ void N_Stokes<dim>::update_velocity (){
 
 	  for (; cell!=endc; ++cell, ++cell_p)
 	    {
+		  if (cell->is_locally_owned() == false)
+		    continue;
+
 	      fe_values.reinit (cell);
 	      fe_pressure_values.reinit (cell_p);
 
@@ -830,6 +898,8 @@ void N_Stokes<dim>::update_velocity (){
 
 	    }
 
+	  velocity_update_matrix.compress (VectorOperation::add);
+	  velocity_update_rhs.compress (VectorOperation::add);
 }
 
 template <int dim>
@@ -841,6 +911,7 @@ void N_Stokes<dim>::solve_update_velocity_system ()
 	  solver_control.set_tolerance(1e-9 * velocity_update_rhs.l2_norm());
 	  solver_control.set_max_steps(velocity_update_rhs.size());
 
+	  TrilinosWrappers::MPI::Vector        completely_distributed_solution(locally_owned_velocity_dofs, MPI_COMM_WORLD);
 
 	  TrilinosWrappers::PreconditionJacobi::AdditionalData data;
 	  data.omega = 0.8;
@@ -856,13 +927,15 @@ void N_Stokes<dim>::solve_update_velocity_system ()
 
 	    }
 
-	  cg_solver->solve(velocity_update_matrix, update_velocity_solution, velocity_update_rhs, preconditioner);
+	  cg_solver->solve(velocity_update_matrix, completely_distributed_solution, velocity_update_rhs, preconditioner);
 
-      std::cout << "   " << solver_control.last_step()
+	  pcout << "   " << solver_control.last_step()
     	            << " CG iterations needed to obtain convergence."
     	            << std::endl;
 
-      constraints_velocity.distribute (update_velocity_solution);
+      constraints_velocity.distribute (completely_distributed_solution);
+
+      update_velocity_solution =    completely_distributed_solution;
 
 }
 
@@ -879,7 +952,7 @@ void N_Stokes<dim>::refine_grid(const unsigned int min_grid_level,
 			                            update_velocity_solution,
 			                            estimated_error_per_cell);
 
-    GridRefinement::refine_and_coarsen_fixed_number (triangulation,
+	 parallel::distributed::GridRefinement::refine_and_coarsen_fixed_number (triangulation,
                                                        estimated_error_per_cell,
                                                        0.6, 0.4);
 
@@ -895,22 +968,35 @@ void N_Stokes<dim>::refine_grid(const unsigned int min_grid_level,
 			cell != triangulation.end_active(min_grid_level); ++cell)
 		cell->clear_coarsen_flag();
 
-	SolutionTransfer<dim, TrilinosWrappers::MPI::Vector> solution_transfer(dof_handler_velocity);
+    std::vector<const TrilinosWrappers::MPI::Vector *> x_velocity (2);
+    x_velocity[0] = &velocity_solution;
+    x_velocity[1] = &old_velocity;
 
-	TrilinosWrappers::MPI::Vector previous_solution;
-	previous_solution = update_velocity_solution;
 
+	parallel::distributed::SolutionTransfer<dim, TrilinosWrappers::MPI::Vector> velocity_transfer(dof_handler_velocity);
 
 	triangulation.prepare_coarsening_and_refinement();
-	solution_transfer.prepare_for_coarsening_and_refinement(previous_solution);
-
+	velocity_transfer.prepare_for_coarsening_and_refinement(x_velocity);
 
 	triangulation.execute_coarsening_and_refinement();
+
 	setup_system();
 
-	solution_transfer.interpolate(previous_solution, update_velocity_solution);
+	TrilinosWrappers::MPI::Vector distribute_velocity_solution1(velocity_system_rhs);
+	TrilinosWrappers::MPI::Vector distribute_velocity_solution2(velocity_system_rhs);
 
-	constraints_velocity.distribute(update_velocity_solution);
+    std::vector<TrilinosWrappers::MPI::Vector *> tmp (2);
+    tmp[0] = &(distribute_velocity_solution1);
+    tmp[1] = &(distribute_velocity_solution2);
+
+    velocity_transfer.interpolate(tmp);
+
+    constraints_velocity.distribute(distribute_velocity_solution1);
+    constraints_velocity.distribute(distribute_velocity_solution2);
+
+    velocity_solution     = distribute_velocity_solution1;
+    old_velocity          = distribute_velocity_solution1;
+
 
 }
 
@@ -950,7 +1036,7 @@ void N_Stokes<dim>::output_results () const
 template <int dim>
 void N_Stokes<dim>::run ()
 {
-  std::cout << "Solving problem in " << dim << " space dimensions." << std::endl;
+  pcout << "Solving problem in " << dim << " space dimensions." << std::endl;
 
   make_grid();
   setup_system ();
@@ -959,23 +1045,25 @@ void N_Stokes<dim>::run ()
   const unsigned int n_adaptive_pre_refinement_steps = 4;
   const unsigned int initial_global_refinement = 2;
 
+  TrilinosWrappers::MPI::Vector locally_relevant_solution;
+
 start_time_iteration:
 
   timestep_number = 0;
   time            = 0;
 
-  VectorTools::project (dof_handler_velocity,
-                        constraints_velocity,
-                        QGauss<dim>(2),
-                        ZeroFunction<dim>(dim),//bubble_gum,
-                        old_velocity);
+  VectorTools::interpolate(dof_handler_velocity,
+                           ZeroFunction<dim>(dim),
+                           non_ghost_velocity);
 
-  update_velocity_solution = old_velocity;
+
+  old_velocity = non_ghost_velocity;
+  /*  update_velocity_solution = old_velocity; */
   output_results();
 
    do{
 
-      std::cout << "Time step " << timestep_number << " at t=" << time
+      pcout << "Time step " << timestep_number << " at t=" << time
                 << std::endl;
 
       assemble_system_velocity ();
@@ -1031,8 +1119,7 @@ int main (int argc, char *argv[])
       deallog.depth_console(0);
 
 
-      Utilities::MPI::MPI_InitFinalize mpi_initialization (argc, argv,
-                                                           numbers::invalid_unsigned_int);
+      Utilities::MPI::MPI_InitFinalize mpi_initialization (argc, argv, 1);
 
       N_Stokes<2> navier_stokes_equation_solver;
       navier_stokes_equation_solver.run();
