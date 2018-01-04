@@ -29,7 +29,7 @@
 #include <deal.II/base/index_set.h>
 #include <deal.II/lac/vector.h>
 #include <deal.II/lac/full_matrix.h>
-#include <deal.II/lac/compressed_sparsity_pattern.h>
+#include <deal.II/lac/dynamic_sparsity_pattern.h>//changed from compressed_sparsity_pattern.h to dynamic_sparsity_pattern.h
 #include <deal.II/lac/sparse_matrix.h>
 #include <deal.II/lac/solver_gmres.h>
 #include <deal.II/lac/solver_cg.h>
@@ -393,7 +393,7 @@ N_Stokes<dim>::N_Stokes ()
   dof_handler_velocity (triangulation),
   dof_handler_pressure (triangulation),
   timestep_number(0),
-  time_step(1. / 500),
+  time_step(1), //changed
   time(0),
   theta_imex(0.5),
   theta_skew(0.5),
@@ -1103,7 +1103,7 @@ start_time_iteration:
       pressure_solution = 0;
       update_velocity_solution = 0;
 
-  }while (time <= 10.0);
+  }while (time <= 1000.0);
 
 
 }
